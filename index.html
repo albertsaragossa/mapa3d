@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="ca"><head><meta charset="utf-8">
+<title>Relleu 3D → STL</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<style>
+ *{box-sizing:border-box} body{margin:0;display:flex;height:100vh;font:14px system-ui,sans-serif;color:#222}
+ #side{width:310px;padding:16px;overflow:auto;border-right:1px solid #ddd;background:#fafafa}
+ #map{flex:1} h1{font-size:18px;margin:0 0 12px}
+ label{display:block;margin:10px 0 3px;font-weight:600}
+ input[type=text],input[type=number]{width:100%;padding:6px;border:1px solid #bbb;border-radius:6px}
+ button{width:100%;margin-top:10px;padding:9px;border:0;border-radius:6px;background:#2f6f4f;color:#fff;font-size:14px;cursor:pointer}
+ button.sec{background:#e9e9e9;color:#222} button:disabled{opacity:.5;cursor:default}
+ #info{margin-top:12px;padding:8px;background:#fff;border:1px solid #ddd;border-radius:6px;min-height:60px;white-space:pre-line}
+ small{color:#666}
+ #pv{display:none;position:fixed;top:0;right:0;bottom:0;left:310px;background:#f3f1ec;z-index:2000}
+ #pv.show{display:block}
+ #pv canvas{width:100%;height:100%;display:block}
+ #pvbar{position:absolute;top:10px;left:10px;display:flex;gap:8px}
+ #pvbar button{width:auto;margin:0;padding:8px 12px}
+ #pvhelp{position:absolute;bottom:8px;left:10px;color:#555;font-size:12px}
+ @media(max-width:700px){body{flex-direction:column-reverse}#side{width:100%;height:45vh;border:0}#pv{left:0;bottom:45vh}}
+</style></head><body>
+<div id="side">
+ <h1>Relleu 3D → STL</h1>
+ <label>Cerca un lloc</label>
+ <input type="text" id="q" placeholder="Montserrat, Everest, Pica d'Estats…">
+ <button class="sec" id="go">Cercar</button>
+ <button class="sec" id="draw">1. Dibuixar rectangle</button>
+ <label>Mida del costat llarg (mm)</label><input type="number" id="mm" value="150" min="10" max="500">
+ <label>Exageració vertical (×)</label><input type="number" id="exag" value="2" step="0.5" min="0.5" max="10">
+ <label>Gruix de la base (mm)</label><input type="number" id="base" value="3" step="0.5" min="1" max="30">
+ <label>Resolució (punts al costat llarg)</label><input type="number" id="res" value="300" min="50" max="600" step="50">
+ <label><input type="checkbox" id="sea" checked> Aplanar el mar (cotes &lt; 0 → 0)</label>
+ <button id="prev" disabled>2. Previsualitzar en 3D</button>
+ <button id="gen" disabled>3. Generar STL</button>
+ <div id="info">Cerca una zona i dibuixa un rectangle arrossegant sobre el mapa.</div>
+ <p><small>Elevació: <a href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noopener">Terrain Tiles</a> (SRTM, ASTER, LiDAR…) ·
+ Mapa: © OpenTopoMap, © OpenStreetMap · Cerca: Nominatim.<br>Tot es calcula al teu navegador.</small></p>
+</div>
+<div id="map"></div>
+<div id="pv"><canvas id="pvcanvas"></canvas>
+ <div id="pvbar"><button class="sec" id="pvback">← Tornar al mapa</button><button id="pvdl">Descarregar STL</button></div>
+ <div id="pvhelp">Arrossega: girar · Roda: zoom · Clic dret: desplaçar</div></div>
+<script>
+const $ = id => document.getElementById(id);
+const MAXZ = 14;
+
+/* ---------- Dades d'elevació ---------- */
+function merc(lat, lon, z) {
+  const n = 256 * 2 ** z;
+  lat = Math.max(Math.min(lat, 85.0511), -85.0511);
+  const r = lat * Math.PI / 180;
+  return [(lon + 180) / 360 * n, (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * n];
+}
+function loadTile(z, x, y) {
+  const n = 2 ** z; x = ((x % n) + n) % n;
+  return new Promise((ok, ko) => {
+    const im = new Image();
+    im.crossOrigin = 'anonymous';
+    im.onload = () => ok(im);
+    im.onerror = () => ko(new Error('No s\'ha pogut descarregar una tessel·la d\'elevació.'));
+    im.src = `https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${z}/${x}/${y}.png`;
+  });
+}
+async function fetchElevation(s, w, n, e, res, progress) {
+  const box = z => { const [x0, y1] = merc(s, w, z), [x1, y0] = merc(n, e, z); return {x0, y0, x1, y1}; };
+  let z = 0;
+  while (z < MAXZ) { const b = box(z); if (Math.max(b.x1 - b.x0, b.y1 - b.y0) >= res) break; z++; }
+  const {x0, y0, x1, y1} = box(z);
+  const tx0 = Math.floor(x0 / 256), tx1 = Math.floor(x1 / 256);
+  const ty0 = Math.floor(y0 / 256), ty1 = Math.floor(y1 / 256);
+  const cols = tx1 - tx0 + 1, rows = ty1 - ty0 + 1;
+  if (cols * rows > 64) throw new Error('Zona massa gran.');
+
+  const cv = document.createElement('canvas');
+  cv.width = cols * 256; cv.height = rows * 256;
+  const ctx = cv.getContext('2d', {willReadFrequently: true});
+  let done = 0; const total = cols * rows;
+  const jobs = [];
+  for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++)
+    jobs.push(loadTile(z, tx, ty).then(im => {
+      ctx.drawImage(im, (tx - tx0) * 256, (ty - ty0) * 256);
+      progress(++done, total);
+    }));
+  await Promise.all(jobs);
+
+  const W = cv.width, H = cv.height;
+  const px = ctx.getImageData(0, 0, W, H).data;
+  const big = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++)
+    big[i] = px[4 * i] * 256 + px[4 * i + 1] + px[4 * i + 2] / 256 - 32768;
+
+  const mid = (s + n) / 2 * Math.PI / 180;
+  const wm = (e - w) * 111320 * Math.cos(mid), hm = (n - s) * 110574;
+  let nx, ny;
+  if (wm >= hm) { nx = res; ny = Math.max(2, Math.round(res * hm / wm)); }
+  else { ny = res; nx = Math.max(2, Math.round(res * wm / hm)); }
+
+  const ox = tx0 * 256, oy = ty0 * 256;
+  const elev = new Float32Array(nx * ny);
+  const clamp = (v, m) => Math.min(Math.max(v, 0), m);
+  for (let i = 0; i < ny; i++) {
+    const fy = clamp(y0 - oy + (i + 0.5) / ny * (y1 - y0) - 0.5, H - 1);
+    const j0 = Math.floor(fy), j1 = Math.min(j0 + 1, H - 1), dy = fy - j0;
+    for (let j = 0; j < nx; j++) {
+      const fx = clamp(x0 - ox + (j + 0.5) / nx * (x1 - x0) - 0.5, W - 1);
+      const i0 = Math.floor(fx), i1 = Math.min(i0 + 1, W - 1), dx = fx - i0;
+      elev[i * nx + j] =
+        (big[j0 * W + i0] * (1 - dx) + big[j0 * W + i1] * dx) * (1 - dy) +
+        (big[j1 * W + i0] * (1 - dx) + big[j1 * W + i1] * dx) * dy;
+    }
+  }
+  return {elev, nx, ny, wm, hm};
+}
+
+/* ---------- Malla estanca + STL binari ---------- */
+function terrain({elev, nx, ny, wm, hm}, longMM, exag, baseMM, clipSea) {
+  const scale = longMM / Math.max(wm, hm);
+  const sx = wm * scale, sy = hm * scale;
+  let zmin = Infinity;
+  const e = new Float32Array(elev.length);
+  for (let i = 0; i < e.length; i++) { e[i] = clipSea ? Math.max(elev[i], 0) : elev[i]; if (e[i] < zmin) zmin = e[i]; }
+  let zmax = 0;
+  const Z = new Float32Array(e.length);
+  for (let i = 0; i < e.length; i++) { Z[i] = baseMM + (e[i] - zmin) * scale * exag; if (Z[i] > zmax) zmax = Z[i]; }
+  const per = [];
+  for (let j = 0; j < nx; j++) per.push([ny - 1, j]);          // sud
+  for (let i = ny - 2; i >= 0; i--) per.push([i, nx - 1]);     // est
+  for (let j = nx - 2; j >= 0; j--) per.push([0, j]);          // nord
+  for (let i = 1; i <= ny - 2; i++) per.push([i, 0]);          // oest
+  return {nx, ny, sx, sy, Z, zmax, per};
+}
+
+function buildSTL(data, longMM, exag, baseMM, clipSea) {
+  const {nx, ny, sx, sy, Z, zmax, per} = terrain(data, longMM, exag, baseMM, clipSea);
+  const N = per.length;
+
+  const count = 2 * (nx - 1) * (ny - 1) + 3 * N;
+  const buf = new ArrayBuffer(84 + 50 * count);
+  const dv = new DataView(buf);
+  new TextEncoder().encodeInto('relleu3d-web', new Uint8Array(buf, 0, 80));
+  dv.setUint32(80, count, true);
+  let o = 84;
+  const put = (ax, ay, az, bx, by, bz, cx, cy, cz) => {
+    const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
+    let nx_ = uy * vz - uz * vy, ny_ = uz * vx - ux * vz, nz_ = ux * vy - uy * vx;
+    const l = Math.hypot(nx_, ny_, nz_) || 1; nx_ /= l; ny_ /= l; nz_ /= l;
+    const f = [nx_, ny_, nz_, ax, ay, az, bx, by, bz, cx, cy, cz];
+    for (let k = 0; k < 12; k++) dv.setFloat32(o + 4 * k, f[k], true);
+    o += 50;
+  };
+  const X = j => j * sx / (nx - 1), Y = i => sy - i * sy / (ny - 1);
+
+  for (let i = 0; i < ny - 1; i++) for (let j = 0; j < nx - 1; j++) {
+    const a = i * nx + j, b = a + 1, c = a + nx, d = c + 1;
+    put(X(j), Y(i), Z[a], X(j), Y(i + 1), Z[c], X(j + 1), Y(i + 1), Z[d]);
+    put(X(j), Y(i), Z[a], X(j + 1), Y(i + 1), Z[d], X(j + 1), Y(i), Z[b]);
+  }
+  for (let k = 0; k < N; k++) {
+    const [i, j] = per[k], [i2, j2] = per[(k + 1) % N];
+    const px = X(j), py = Y(i), pz = Z[i * nx + j], qx = X(j2), qy = Y(i2), qz = Z[i2 * nx + j2];
+    put(px, py, pz, px, py, 0, qx, qy, 0);
+    put(px, py, pz, qx, qy, 0, qx, qy, qz);
+    put(sx / 2, sy / 2, 0, qx, qy, 0, px, py, 0);
+  }
+  return {blob: new Blob([buf], {type: 'application/octet-stream'}), dims: [sx, sy, zmax]};
+}
+
+/* ---------- Interfície ---------- */
+const map = L.map('map').setView([41.9, 1.6], 8);
+L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {maxZoom: 17,
+  attribution: '© OpenTopoMap, © OpenStreetMap'}).addTo(map);
+let rect = null, start = null, drawing = false, mode = false;
+
+function update() {
+  const b = rect.getBounds(), lat = (b.getSouth() + b.getNorth()) / 2;
+  const w = (b.getEast() - b.getWest()) * 111.32 * Math.cos(lat * Math.PI / 180);
+  const h = (b.getNorth() - b.getSouth()) * 110.574;
+  const mm = +$('mm').value, k = mm / Math.max(w, h);
+  $('info').textContent = `Zona: ${w.toFixed(1)} × ${h.toFixed(1)} km\nModel: ${(w * k).toFixed(0)} × ${(h * k).toFixed(0)} mm\nEscala ≈ 1:${Math.round(Math.max(w, h) * 1e6 / mm).toLocaleString('ca')}`;
+  $('gen').disabled = false; $('prev').disabled = false;
+}
+$('draw').onclick = () => {
+  mode = true; map.dragging.disable(); map.getContainer().style.cursor = 'crosshair';
+  $('info').textContent = 'Arrossega sobre el mapa per marcar la zona.';
+};
+map.on('mousedown', e => {
+  if (!mode) return; drawing = true; start = e.latlng;
+  if (rect) map.removeLayer(rect);
+  rect = L.rectangle([start, start], {color: '#e4572e', weight: 2}).addTo(map);
+});
+map.on('mousemove', e => { if (drawing) { rect.setBounds([start, e.latlng]); update(); } });
+map.on('mouseup', e => {
+  if (!drawing) return; drawing = false; mode = false;
+  map.dragging.enable(); map.getContainer().style.cursor = '';
+  rect.setBounds([start, e.latlng]); update();
+});
+$('mm').oninput = () => { if (rect) update(); };
+
+async function search() {
+  const q = $('q').value.trim(); if (!q) return;
+  try {
+    const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q));
+    const j = await r.json();
+    if (!j.length) { $('info').textContent = 'No s\'ha trobat el lloc.'; return; }
+    const bb = j[0].boundingbox.map(Number);
+    map.fitBounds([[bb[0], bb[2]], [bb[1], bb[3]]]);
+  } catch (err) { $('info').textContent = 'Error de cerca: ' + err.message; }
+}
+$('go').onclick = search;
+$('q').onkeydown = ev => { if (ev.key === 'Enter') search(); };
+
+let lastData = null, lastKey = '', frame = true;
+let pvReady = false, pvMeshes = [], renderer, scene, camera, controls;
+
+function setBusy(v) { $('gen').disabled = $('prev').disabled = $('pvdl').disabled = v || !rect; }
+
+async function ensureData() {
+  const b = map.wrapLatLngBounds(rect.getBounds());
+  const res = Math.min(600, Math.max(50, +$('res').value || 300));
+  const key = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res].join();
+  if (key !== lastKey || !lastData) {
+    lastData = await fetchElevation(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
+      (d, t) => { $('info').textContent = `Descarregant dades d'elevació… ${d}/${t}`; });
+    lastKey = key; frame = true;
+  }
+  return lastData;
+}
+
+async function download() {
+  setBusy(true);
+  try {
+    const data = await ensureData();
+    $('info').textContent = 'Generant la malla…';
+    await new Promise(r => setTimeout(r, 30));
+    const {blob, dims} = buildSTL(data, +$('mm').value, +$('exag').value, +$('base').value, $('sea').checked);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = 'relleu.stl'; a.click();
+    $('info').textContent = `STL generat ✔ (${(blob.size / 1e6).toFixed(1)} MB)\nMida: ${dims[0].toFixed(0)} × ${dims[1].toFixed(0)} × ${dims[2].toFixed(1)} mm`;
+  } catch (err) { $('info').textContent = 'Error: ' + err.message; }
+  finally { setBusy(false); }
+}
+$('gen').onclick = download;
+$('pvdl').onclick = download;
+
+/* ---------- Previsualització 3D (three.js) ---------- */
+function initPreview() {
+  renderer = new THREE.WebGLRenderer({canvas: $('pvcanvas'), antialias: true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0xf3f1ec);
+  camera = new THREE.PerspectiveCamera(45, 1, 1, 5000);
+  camera.up.set(0, 0, 1);                       // Z amunt, com al model imprès
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x998877, 0.75));
+  const dl = new THREE.DirectionalLight(0xffffff, 0.8);
+  dl.position.set(-1, 1, 2); scene.add(dl);     // llum des del NW, com als mapes
+  controls = new THREE.OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  window.addEventListener('resize', resizePreview);
+  (function loop() {
+    requestAnimationFrame(loop);
+    if ($('pv').classList.contains('show')) { controls.update(); renderer.render(scene, camera); }
+  })();
+}
+function resizePreview() {
+  if (!pvReady) return;
+  const c = $('pvcanvas'), w = c.clientWidth, h = c.clientHeight;
+  if (!w || !h) return;
+  renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+function rebuildPreview() {
+  pvMeshes.forEach(m => { scene.remove(m); m.geometry.dispose(); m.material.dispose(); });
+  pvMeshes = [];
+  const {nx, ny, sx, sy, Z, zmax, per} = terrain(lastData, +$('mm').value, +$('exag').value, +$('base').value, $('sea').checked);
+  const X = j => j * sx / (nx - 1), Y = i => sy - i * sy / (ny - 1);
+  const zmin = +$('base').value, span = Math.max(zmax - zmin, 1e-6);
+  const stops = [[0.33, 0.52, 0.28], [0.62, 0.52, 0.34], [0.96, 0.96, 0.96]];
+  const pos = new Float32Array(nx * ny * 3), col = new Float32Array(nx * ny * 3);
+  for (let i = 0; i < ny; i++) for (let j = 0; j < nx; j++) {
+    const p = i * nx + j;
+    pos[3 * p] = X(j); pos[3 * p + 1] = Y(i); pos[3 * p + 2] = Z[p];
+    const t = Math.min(Math.max((Z[p] - zmin) / span, 0), 1) * 2, k = Math.min(Math.floor(t), 1), f = t - k;
+    for (let c = 0; c < 3; c++) col[3 * p + c] = stops[k][c] * (1 - f) + stops[k + 1][c] * f;
+  }
+  const idx = new Uint32Array(6 * (nx - 1) * (ny - 1)); let q = 0;
+  for (let i = 0; i < ny - 1; i++) for (let j = 0; j < nx - 1; j++) {
+    const a = i * nx + j, b = a + 1, c = a + nx, d = c + 1;
+    idx.set([a, c, d, a, d, b], q); q += 6;
+  }
+  const g1 = new THREE.BufferGeometry();
+  g1.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g1.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g1.setIndex(new THREE.BufferAttribute(idx, 1));
+  g1.computeVertexNormals();
+  const top = new THREE.Mesh(g1, new THREE.MeshStandardMaterial({vertexColors: true, roughness: 0.9}));
+
+  const sp = []; // parets laterals + base
+  for (let k = 0; k < per.length; k++) {
+    const [i, j] = per[k], [i2, j2] = per[(k + 1) % per.length];
+    const px = X(j), py = Y(i), pz = Z[i * nx + j], qx = X(j2), qy = Y(i2), qz = Z[i2 * nx + j2];
+    sp.push(px, py, pz, px, py, 0, qx, qy, 0, px, py, pz, qx, qy, 0, qx, qy, qz, sx / 2, sy / 2, 0, qx, qy, 0, px, py, 0);
+  }
+  const g2 = new THREE.BufferGeometry();
+  g2.setAttribute('position', new THREE.BufferAttribute(new Float32Array(sp), 3));
+  g2.computeVertexNormals();
+  const side = new THREE.Mesh(g2, new THREE.MeshStandardMaterial({color: 0xcfc8b8, roughness: 0.9}));
+
+  scene.add(top, side); pvMeshes = [top, side];
+  if (frame) {
+    const m = Math.max(sx, sy);
+    controls.target.set(sx / 2, sy / 2, zmax / 3);
+    camera.position.set(sx / 2, -m * 0.6, m * 0.9);
+    camera.near = m / 100; camera.far = m * 20; camera.updateProjectionMatrix();
+    controls.update(); frame = false;
+  }
+}
+async function showPreview() {
+  setBusy(true);
+  try {
+    await ensureData();
+    if (!pvReady) { initPreview(); pvReady = true; }
+    $('pv').classList.add('show'); resizePreview(); rebuildPreview();
+    $('info').textContent = 'Previsualització activa. Els paràmetres d\'aquí s\'apliquen en directe.';
+  } catch (err) { $('info').textContent = 'Error: ' + err.message; }
+  finally { setBusy(false); }
+}
+$('prev').onclick = showPreview;
+$('pvback').onclick = () => $('pv').classList.remove('show');
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') $('pv').classList.remove('show'); });
+['mm', 'exag', 'base', 'sea'].forEach(id => $(id).addEventListener('input', () => {
+  if (pvReady && $('pv').classList.contains('show')) rebuildPreview();
+}));
+</script></body></html>
