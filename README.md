@@ -18,3 +18,4 @@ Puja `index.html` al repositori → *Settings* → *Pages* → *Deploy from a br
 - Cerca: [Nominatim](https://nominatim.org). Respecta'n la [política d'ús](https://operations.osmfoundation.org/policies/nominatim/).
 - Previsualització 3D: [three.js](https://threejs.org) (MIT).
 - Mapes: [Leaflet](https://leafletjs.com).
+- Autor: Albert Saragossa Alòs
