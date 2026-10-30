@@ -6,6 +6,7 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/geotiff@2.1.3/dist-browser/geotiff.js"></script>
 <style>
  *{box-sizing:border-box} body{margin:0;display:flex;height:100vh;font:14px system-ui,sans-serif;color:#222}
  #side{width:310px;padding:16px;overflow:auto;border-right:1px solid #ddd;background:#fafafa}
@@ -35,9 +36,10 @@
  <label>Gruix de la base (mm)</label><input type="number" id="base" value="3" step="0.5" min="1" max="30">
  <label>Resolució (punts al costat llarg)</label><input type="number" id="res" value="300" min="50" max="1200" step="50"><small id="resnote"></small>
  <label><input type="checkbox" id="sea" checked> Aplanar el mar (cotes &lt; 0 → 0)</label>
+ <label><input type="checkbox" id="icgc" checked> A Catalunya, usar l'ICGC (LiDAR, fins a 0,5 m) — experimental</label>
  <label>Dades d'alta resolució (opcional)</label>
- <input type="file" id="file" accept=".asc,.txt">
- <small>Fitxer ASCII Grid (.asc), p. ex. el MET 2×2 m de l'ICGC. Substitueix el rectangle del mapa.</small>
+ <input type="file" id="file" accept=".tif,.tiff,.asc,.txt">
+ <small>GeoTIFF (.tif) de l'ICGC o ASCII Grid (.asc). Si hi ha un rectangle dins la zona del fitxer, es retalla; si no, s'usa tot el fitxer.</small>
  <button class="sec" id="clearfile" hidden>Tornar a les dades del mapa</button>
  <button id="prev" disabled>2. Previsualitzar en 3D</button>
  <button id="gen" disabled>3. Generar STL</button>
@@ -245,7 +247,7 @@ function gridToData(f, res) {
   if (nc >= nr) { nx = Math.min(res, nc); ny = Math.max(2, Math.round(nx * nr / nc)); }
   else { ny = Math.min(res, nr); nx = Math.max(2, Math.round(ny * nc / nr)); }
   let mn = Infinity;
-  for (let i = 0; i < g.length; i++) { const v = g[i]; if (v !== nod && v === v && v < mn) mn = v; }
+  for (let i = 0; i < g.length; i++) { const v = g[i]; if (v !== nod && v > -500 && v < mn) mn = v; }
   const out = new Float32Array(nx * ny);
   for (let i = 0; i < ny; i++) {
     const y0 = Math.floor(i * nr / ny), y1 = Math.max(y0 + 1, Math.floor((i + 1) * nr / ny));
@@ -253,12 +255,12 @@ function gridToData(f, res) {
       const x0 = Math.floor(j * nc / nx), x1 = Math.max(x0 + 1, Math.floor((j + 1) * nc / nx));
       let sum = 0, cnt = 0;
       for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
-        const v = g[y * nc + x]; if (v !== nod && v === v) { sum += v; cnt++; }
+        const v = g[y * nc + x]; if (v !== nod && v > -500) { sum += v; cnt++; }
       }
       out[i * nx + j] = cnt ? sum / cnt : mn;
     }
   }
-  return {elev: out, nx, ny, wm: nc * cell, hm: nr * cell};
+  return {elev: out, nx, ny, wm: nc * cell, hm: nr * (f.celly || cell)};
 }
 function decimate(d, maxV) {
   const {elev, nx, ny, wm, hm} = d;
@@ -273,7 +275,86 @@ function decimate(d, maxV) {
   return {elev: out, nx: pnx, ny: pny, wm, hm};
 }
 
-let lastData = null, lastKey = '', frame = true;
+/* ---------- ICGC (Catalunya): UTM 31N, WMS i GeoTIFF ---------- */
+function utm31(lat, lon) {   // ETRS89 / UTM 31N (EPSG:25831), sèrie de Krüger
+  const a = 6378137, f = 1 / 298.257222101, k0 = 0.9996, lon0 = 3 * Math.PI / 180;
+  const n = f / (2 - f), A = a / (1 + n) * (1 + n * n / 4 + n ** 4 / 64);
+  const al = [n / 2 - 2 * n * n / 3 + 5 * n ** 3 / 16, 13 * n * n / 48 - 3 * n ** 3 / 5, 61 * n ** 3 / 240];
+  const phi = lat * Math.PI / 180, lam = lon * Math.PI / 180 - lon0, q = 2 * Math.sqrt(n) / (1 + n);
+  const t = Math.sinh(Math.atanh(Math.sin(phi)) - q * Math.atanh(q * Math.sin(phi)));
+  const xi = Math.atan2(t, Math.cos(lam)), eta = Math.atanh(Math.sin(lam) / Math.sqrt(1 + t * t));
+  let X = eta, Y = xi;
+  for (let j = 1; j <= 3; j++) {
+    X += al[j - 1] * Math.cos(2 * j * xi) * Math.sinh(2 * j * eta);
+    Y += al[j - 1] * Math.sin(2 * j * xi) * Math.cosh(2 * j * eta);
+  }
+  return [500000 + k0 * A * X, k0 * A * Y];
+}
+const ICGC_WMS = 'https://geoserveis.icgc.cat/servei/catalunya/elevacions-territorial/wms';
+const ICGC_LAYER = {
+  0.5: 'model-elevacions-terreny-catalunya-lidar-50cm-2021-2023',
+  1: 'model-elevacions-terreny-catalunya-lidar-1m-2021-2023',
+  5: 'model-elevacions-terreny-catalunya-lidar-5m-2021-2023'};
+function inCatalonia(b) { return b.getSouth() >= 40.4 && b.getNorth() <= 42.95 && b.getWest() >= 0.1 && b.getEast() <= 3.4; }
+
+async function fetchICGC(s, w, n, e, res, progress) {
+  const pts = [[s, w], [s, e], [n, w], [n, e]].map(p => utm31(p[0], p[1]));
+  const Es = pts.map(p => p[0]), Ns = pts.map(p => p[1]);
+  const x0 = Math.min(...Es), x1 = Math.max(...Es), y0 = Math.min(...Ns), y1 = Math.max(...Ns);
+  const W = x1 - x0, H = y1 - y0, want = Math.max(W, H) / res;
+  const cell = want >= 5 ? 5 : want >= 1 ? 1 : 0.5;     // capa més fina que el pas desitjat
+  let nx, ny;
+  if (W >= H) { nx = res; ny = Math.max(2, Math.round(res * H / W)); } else { ny = res; nx = Math.max(2, Math.round(res * W / H)); }
+  nx = Math.max(2, Math.min(nx, Math.round(W / cell))); ny = Math.max(2, Math.min(ny, Math.round(H / cell)));
+  const out = new Float32Array(nx * ny), T = 1024, jobs = [];
+  for (let j0 = 0; j0 < ny; j0 += T) for (let i0 = 0; i0 < nx; i0 += T) jobs.push([i0, j0]);
+  let done = 0;
+  for (const [i0, j0] of jobs) {
+    const tw = Math.min(T, nx - i0), th = Math.min(T, ny - j0);
+    const bx0 = x0 + i0 * W / nx, bx1 = x0 + (i0 + tw) * W / nx;
+    const by1 = y1 - j0 * H / ny, by0 = y1 - (j0 + th) * H / ny;
+    const url = `${ICGC_WMS}?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=${ICGC_LAYER[cell]}&STYLES=&CRS=EPSG:25831&BBOX=${bx0},${by0},${bx1},${by1}&WIDTH=${tw}&HEIGHT=${th}&FORMAT=image/tiff`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('el servei ha respost ' + r.status);
+    let img;
+    try { img = await (await GeoTIFF.fromArrayBuffer(await r.arrayBuffer())).getImage(); }
+    catch (err) { throw new Error('la resposta del servei no és un TIFF vàlid'); }
+    const a = (await img.readRasters({samples: [0]}))[0];
+    if (!(a instanceof Float32Array || a instanceof Float64Array)) throw new Error('el WMS retorna una imatge i no alçades reals');
+    if (img.getWidth() !== tw || img.getHeight() !== th) throw new Error('mida de resposta inesperada');
+    for (let y = 0; y < th; y++) for (let x = 0; x < tw; x++) out[(j0 + y) * nx + i0 + x] = a[y * tw + x];
+    progress(++done, jobs.length);
+  }
+  let mn = Infinity;
+  for (let i = 0; i < out.length; i++) if (out[i] > -500 && out[i] < mn) mn = out[i];
+  if (mn === Infinity) throw new Error('el servei no té dades en aquesta zona');
+  for (let i = 0; i < out.length; i++) if (!(out[i] > -500)) out[i] = mn;
+  return {elev: out, nx, ny, wm: W, hm: H, cell};
+}
+
+async function tifToGrid(t) {   // GeoTIFF local (EPSG:25831): retalla al rectangle si hi cau
+  let l = 0, tp = 0, r = t.W, b = t.H;
+  if (rect) {
+    const bd = map.wrapLatLngBounds(rect.getBounds());
+    const pts = [[bd.getSouth(), bd.getWest()], [bd.getSouth(), bd.getEast()], [bd.getNorth(), bd.getWest()], [bd.getNorth(), bd.getEast()]].map(p => utm31(p[0], p[1]));
+    const Es = pts.map(p => p[0]), Ns = pts.map(p => p[1]);
+    const l2 = Math.max(0, Math.floor((Math.min(...Es) - t.ox) / t.rx)), r2 = Math.min(t.W, Math.ceil((Math.max(...Es) - t.ox) / t.rx));
+    const t2 = Math.max(0, Math.floor((t.oy - Math.max(...Ns)) / t.ry)), b2 = Math.min(t.H, Math.ceil((t.oy - Math.min(...Ns)) / t.ry));
+    if (r2 - l2 > 1 && b2 - t2 > 1) { l = l2; r = r2; tp = t2; b = b2; }
+  }
+  let w = r - l, h = b - tp;
+  const opts = {window: [l, tp, r, b], samples: [0]};
+  if (w * h > 2.5e7) {   // finestra enorme: submostreig per no esgotar memòria
+    const k = Math.sqrt(2.5e7 / (w * h));
+    opts.width = Math.round(w * k); opts.height = Math.round(h * k); opts.resampleMethod = 'nearest';
+    w = opts.width; h = opts.height;
+  }
+  const a = (await t.img.readRasters(opts))[0];
+  return {g: a instanceof Float32Array ? a : Float32Array.from(a), nc: w, nr: h,
+          cell: (r - l) * t.rx / w, celly: (b - tp) * t.ry / h, nod: t.nod};
+}
+
+let lastData = null, lastKey = '', lastSource = '', frame = true;
 let pvReady = false, pvMeshes = [], renderer, scene, camera, controls;
 
 function setBusy(v) { $('gen').disabled = $('prev').disabled = $('pvdl').disabled = v || (!rect && !fileSrc); }
@@ -281,16 +362,34 @@ function setBusy(v) { $('gen').disabled = $('prev').disabled = $('pvdl').disable
 async function ensureData() {
   const res = Math.min(1200, Math.max(50, +$('res').value || 300));
   if (fileSrc) {
-    const k = 'file:' + fileSrc.name + ':' + res;
-    if (k !== lastKey) { lastData = gridToData(fileSrc, res); lastKey = k; frame = true; }
+    const bb = fileSrc.tif && rect ? map.wrapLatLngBounds(rect.getBounds()).toBBoxString() : '';
+    const k = 'file:' + fileSrc.name + ':' + res + ':' + bb;
+    if (k !== lastKey) {
+      $('info').textContent = 'Processant el fitxer…';
+      await new Promise(r => setTimeout(r, 30));
+      lastData = gridToData(fileSrc.tif ? await tifToGrid(fileSrc.tif) : fileSrc, res);
+      lastKey = k; lastSource = 'fitxer ' + fileSrc.name; frame = true;
+    }
     return lastData;
   }
   const b = map.wrapLatLngBounds(rect.getBounds());
-  const key = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res].join();
+  const useIcgc = $('icgc').checked && inCatalonia(b);
+  const key = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res, useIcgc].join();
   if (key !== lastKey || !lastData) {
-    lastData = await fetchElevation(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
-      (d, t) => { $('info').textContent = `Descarregant dades d'elevació… ${d}/${t}`; });
-    lastKey = key; frame = true;
+    let d = null, src = '';
+    if (useIcgc) {
+      try {
+        d = await fetchICGC(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
+          (i, t) => { $('info').textContent = `Descarregant dades de l'ICGC… ${i}/${t}`; });
+        src = `ICGC (LiDAR, capa de ${d.cell === 0.5 ? '50 cm' : d.cell + ' m'})`;
+      } catch (err) { src = 'Terrain Tiles (ICGC no disponible: ' + err.message + ')'; }
+    }
+    if (!d) {
+      d = await fetchElevation(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
+        (i, t) => { $('info').textContent = `Descarregant dades d'elevació… ${i}/${t}`; });
+      src = src || 'Terrain Tiles (mundial)';
+    }
+    lastData = d; lastSource = src; lastKey = key; frame = true;
   }
   return lastData;
 }
@@ -304,7 +403,7 @@ async function download() {
     const {blob, dims} = buildSTL(data, +$('mm').value, +$('exag').value, +$('base').value, $('sea').checked);
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = 'relleu.stl'; a.click();
-    $('info').textContent = `STL generat ✔ (${(blob.size / 1e6).toFixed(1)} MB)\nMida: ${dims[0].toFixed(0)} × ${dims[1].toFixed(0)} × ${dims[2].toFixed(1)} mm`;
+    $('info').textContent = `STL generat ✔ (${(blob.size / 1e6).toFixed(1)} MB)\nMida: ${dims[0].toFixed(0)} × ${dims[1].toFixed(0)} × ${dims[2].toFixed(1)} mm\nFont: ${lastSource}`;
   } catch (err) { $('info').textContent = 'Error: ' + err.message; }
   finally { setBusy(false); }
 }
@@ -314,9 +413,17 @@ $('file').onchange = async ev => {
   $('info').textContent = 'Llegint ' + f.name + '…';
   try {
     await new Promise(r => setTimeout(r, 30));
-    fileSrc = parseASC(await f.text()); fileSrc.name = f.name; lastKey = '';
-    $('clearfile').hidden = false; setBusy(false);
-    $('info').textContent = `Fitxer carregat: ${fileSrc.nc}×${fileSrc.nr} punts, cel·la de ${fileSrc.cell} m (${(fileSrc.nc * fileSrc.cell / 1000).toFixed(1)}×${(fileSrc.nr * fileSrc.cell / 1000).toFixed(1)} km).\nEs farà servir en lloc del rectangle del mapa.`;
+    let msg;
+    if (/\.tiff?$/i.test(f.name)) {
+      const img = await (await GeoTIFF.fromBlob(f)).getImage();
+      const [ox, oy] = img.getOrigin(), [rx, ry] = img.getResolution(), nd = img.getGDALNoData();
+      fileSrc = {name: f.name, tif: {img, W: img.getWidth(), H: img.getHeight(), ox, oy, rx: Math.abs(rx), ry: Math.abs(ry), nod: nd == null ? -9999 : nd}};
+      msg = `GeoTIFF carregat: ${fileSrc.tif.W}×${fileSrc.tif.H} punts, cel·la de ${fileSrc.tif.rx} m.\nSi hi ha un rectangle dibuixat dins la zona, es retallarà; si no, s'usa tot el fitxer.`;
+    } else {
+      fileSrc = parseASC(await f.text()); fileSrc.name = f.name;
+      msg = `Fitxer carregat: ${fileSrc.nc}×${fileSrc.nr} punts, cel·la de ${fileSrc.cell} m.\nEs farà servir en lloc del rectangle del mapa.`;
+    }
+    lastKey = ''; $('clearfile').hidden = false; setBusy(false); $('info').textContent = msg;
   } catch (err) { fileSrc = null; $('info').textContent = 'Error llegint el fitxer: ' + err.message; }
 };
 $('clearfile').onclick = () => {
@@ -408,7 +515,7 @@ async function showPreview() {
     await ensureData();
     if (!pvReady) { initPreview(); pvReady = true; }
     $('pv').classList.add('show'); resizePreview(); rebuildPreview();
-    $('info').textContent = 'Previsualització activa. Els paràmetres d\'aquí s\'apliquen en directe.';
+    $('info').textContent = 'Previsualització activa.\nFont: ' + lastSource + '\nEls paràmetres s\'apliquen en directe.';
   } catch (err) { $('info').textContent = 'Error: ' + err.message; }
   finally { setBusy(false); }
 }
