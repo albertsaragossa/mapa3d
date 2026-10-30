@@ -33,8 +33,12 @@
  <label>Mida del costat llarg (mm)</label><input type="number" id="mm" value="150" min="10" max="500">
  <label>Exageració vertical (×)</label><input type="number" id="exag" value="2" step="0.5" min="0.5" max="10">
  <label>Gruix de la base (mm)</label><input type="number" id="base" value="3" step="0.5" min="1" max="30">
- <label>Resolució (punts al costat llarg)</label><input type="number" id="res" value="300" min="50" max="600" step="50">
+ <label>Resolució (punts al costat llarg)</label><input type="number" id="res" value="300" min="50" max="1200" step="50"><small id="resnote"></small>
  <label><input type="checkbox" id="sea" checked> Aplanar el mar (cotes &lt; 0 → 0)</label>
+ <label>Dades d'alta resolució (opcional)</label>
+ <input type="file" id="file" accept=".asc,.txt">
+ <small>Fitxer ASCII Grid (.asc), p. ex. el MET 2×2 m de l'ICGC. Substitueix el rectangle del mapa.</small>
+ <button class="sec" id="clearfile" hidden>Tornar a les dades del mapa</button>
  <button id="prev" disabled>2. Previsualitzar en 3D</button>
  <button id="gen" disabled>3. Generar STL</button>
  <div id="info">Cerca una zona i dibuixa un rectangle arrossegant sobre el mapa.</div>
@@ -47,7 +51,7 @@
  <div id="pvhelp">Arrossega: girar · Roda: zoom · Clic dret: desplaçar</div></div>
 <script>
 const $ = id => document.getElementById(id);
-const MAXZ = 14;
+const MAXZ = 15;
 
 /* ---------- Dades d'elevació ---------- */
 function merc(lat, lon, z) {
@@ -74,7 +78,7 @@ async function fetchElevation(s, w, n, e, res, progress) {
   const tx0 = Math.floor(x0 / 256), tx1 = Math.floor(x1 / 256);
   const ty0 = Math.floor(y0 / 256), ty1 = Math.floor(y1 / 256);
   const cols = tx1 - tx0 + 1, rows = ty1 - ty0 + 1;
-  if (cols * rows > 64) throw new Error('Zona massa gran.');
+  if (cols * rows > 144) throw new Error('Zona massa gran.');
 
   const cv = document.createElement('canvas');
   cv.width = cols * 256; cv.height = rows * 256;
@@ -214,14 +218,74 @@ async function search() {
 $('go').onclick = search;
 $('q').onkeydown = ev => { if (ev.key === 'Enter') search(); };
 
+/* ---------- Fitxers ASCII Grid (.asc) ---------- */
+function parseASC(txt) {
+  const h = {}; let pos = 0;
+  for (;;) {
+    let nl = txt.indexOf('\n', pos); if (nl < 0) break;
+    const line = txt.slice(pos, nl).trim();
+    if (!/^[A-Za-z]/.test(line)) break;
+    const [k, v] = line.split(/\s+/); h[k.toLowerCase()] = parseFloat(v); pos = nl + 1;
+  }
+  const nc = h.ncols, nr = h.nrows, cell = h.cellsize;
+  if (!(nc > 0 && nr > 0 && cell > 0)) throw new Error('No sembla un ASCII Grid vàlid.');
+  const g = new Float32Array(nc * nr), L = txt.length; let n = 0, i = pos;
+  while (n < g.length && i < L) {
+    while (i < L && txt.charCodeAt(i) <= 32) i++;
+    let j = i; while (j < L && txt.charCodeAt(j) > 32) j++;
+    if (j > i) g[n++] = parseFloat(txt.slice(i, j));
+    i = j;
+  }
+  if (n < g.length) throw new Error('El fitxer està incomplet.');
+  return {g, nc, nr, cell, nod: h.nodata_value !== undefined ? h.nodata_value : -9999};
+}
+function gridToData(f, res) {
+  const {g, nc, nr, cell, nod} = f;
+  let nx, ny;
+  if (nc >= nr) { nx = Math.min(res, nc); ny = Math.max(2, Math.round(nx * nr / nc)); }
+  else { ny = Math.min(res, nr); nx = Math.max(2, Math.round(ny * nc / nr)); }
+  let mn = Infinity;
+  for (let i = 0; i < g.length; i++) { const v = g[i]; if (v !== nod && v === v && v < mn) mn = v; }
+  const out = new Float32Array(nx * ny);
+  for (let i = 0; i < ny; i++) {
+    const y0 = Math.floor(i * nr / ny), y1 = Math.max(y0 + 1, Math.floor((i + 1) * nr / ny));
+    for (let j = 0; j < nx; j++) {
+      const x0 = Math.floor(j * nc / nx), x1 = Math.max(x0 + 1, Math.floor((j + 1) * nc / nx));
+      let sum = 0, cnt = 0;
+      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) {
+        const v = g[y * nc + x]; if (v !== nod && v === v) { sum += v; cnt++; }
+      }
+      out[i * nx + j] = cnt ? sum / cnt : mn;
+    }
+  }
+  return {elev: out, nx, ny, wm: nc * cell, hm: nr * cell};
+}
+function decimate(d, maxV) {
+  const {elev, nx, ny, wm, hm} = d;
+  if (nx * ny <= maxV) return d;
+  const k = Math.sqrt(nx * ny / maxV);
+  const pnx = Math.max(2, Math.round(nx / k)), pny = Math.max(2, Math.round(ny / k));
+  const out = new Float32Array(pnx * pny);
+  for (let i = 0; i < pny; i++) {
+    const si = Math.round(i * (ny - 1) / (pny - 1));
+    for (let j = 0; j < pnx; j++) out[i * pnx + j] = elev[si * nx + Math.round(j * (nx - 1) / (pnx - 1))];
+  }
+  return {elev: out, nx: pnx, ny: pny, wm, hm};
+}
+
 let lastData = null, lastKey = '', frame = true;
 let pvReady = false, pvMeshes = [], renderer, scene, camera, controls;
 
-function setBusy(v) { $('gen').disabled = $('prev').disabled = $('pvdl').disabled = v || !rect; }
+function setBusy(v) { $('gen').disabled = $('prev').disabled = $('pvdl').disabled = v || (!rect && !fileSrc); }
 
 async function ensureData() {
+  const res = Math.min(1200, Math.max(50, +$('res').value || 300));
+  if (fileSrc) {
+    const k = 'file:' + fileSrc.name + ':' + res;
+    if (k !== lastKey) { lastData = gridToData(fileSrc, res); lastKey = k; frame = true; }
+    return lastData;
+  }
   const b = map.wrapLatLngBounds(rect.getBounds());
-  const res = Math.min(600, Math.max(50, +$('res').value || 300));
   const key = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res].join();
   if (key !== lastKey || !lastData) {
     lastData = await fetchElevation(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
@@ -244,6 +308,26 @@ async function download() {
   } catch (err) { $('info').textContent = 'Error: ' + err.message; }
   finally { setBusy(false); }
 }
+let fileSrc = null;
+$('file').onchange = async ev => {
+  const f = ev.target.files[0]; if (!f) return;
+  $('info').textContent = 'Llegint ' + f.name + '…';
+  try {
+    await new Promise(r => setTimeout(r, 30));
+    fileSrc = parseASC(await f.text()); fileSrc.name = f.name; lastKey = '';
+    $('clearfile').hidden = false; setBusy(false);
+    $('info').textContent = `Fitxer carregat: ${fileSrc.nc}×${fileSrc.nr} punts, cel·la de ${fileSrc.cell} m (${(fileSrc.nc * fileSrc.cell / 1000).toFixed(1)}×${(fileSrc.nr * fileSrc.cell / 1000).toFixed(1)} km).\nEs farà servir en lloc del rectangle del mapa.`;
+  } catch (err) { fileSrc = null; $('info').textContent = 'Error llegint el fitxer: ' + err.message; }
+};
+$('clearfile').onclick = () => {
+  fileSrc = null; lastKey = ''; $('file').value = ''; $('clearfile').hidden = true; setBusy(false);
+  $('info').textContent = 'Tornes a les dades del mapa.';
+};
+function resNote() {
+  const r = +$('res').value || 300, tri = 2 * r * r;
+  $('resnote').textContent = `≈ ${(tri / 1e6).toFixed(2)} M triangles · STL ≈ ${(tri * 50 / 1e6).toFixed(0)} MB` + (r > 800 ? ' (pesat per al llescador)' : '');
+}
+$('res').addEventListener('input', resNote); resNote();
 $('gen').onclick = download;
 $('pvdl').onclick = download;
 
@@ -275,7 +359,7 @@ function resizePreview() {
 function rebuildPreview() {
   pvMeshes.forEach(m => { scene.remove(m); m.geometry.dispose(); m.material.dispose(); });
   pvMeshes = [];
-  const {nx, ny, sx, sy, Z, zmax, per} = terrain(lastData, +$('mm').value, +$('exag').value, +$('base').value, $('sea').checked);
+  const {nx, ny, sx, sy, Z, zmax, per} = terrain(decimate(lastData, 250000), +$('mm').value, +$('exag').value, +$('base').value, $('sea').checked);
   const X = j => j * sx / (nx - 1), Y = i => sy - i * sy / (ny - 1);
   const zmin = +$('base').value, span = Math.max(zmax - zmin, 1e-6);
   const stops = [[0.33, 0.52, 0.28], [0.62, 0.52, 0.34], [0.96, 0.96, 0.96]];
