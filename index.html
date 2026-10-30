@@ -17,6 +17,10 @@
  button.sec{background:#e9e9e9;color:#222} button:disabled{opacity:.5;cursor:default}
  #info{margin-top:12px;padding:8px;background:#fff;border:1px solid #ddd;border-radius:6px;min-height:60px;white-space:pre-line}
  small{color:#666}
+ #icgcbox{margin-top:10px;padding:8px;background:#eef6f0;border:1px solid #b9d8c4;border-radius:6px}
+ #icgcbox[hidden]{display:none}
+ #icgclink{display:block;margin:8px 0;padding:9px;border-radius:6px;background:#2f6f4f;color:#fff;text-align:center;text-decoration:none}
+ #utmbox{font-size:12px;color:#444;margin-bottom:6px;word-break:break-word}
  #pv{display:none;position:fixed;top:0;right:0;bottom:0;left:310px;background:#f3f1ec;z-index:2000}
  #pv.show{display:block}
  #pv canvas{width:100%;height:100%;display:block}
@@ -44,6 +48,14 @@
  <button id="prev" disabled>2. Previsualitzar en 3D</button>
  <button id="gen" disabled>3. Generar STL</button>
  <div id="info">Cerca una zona i dibuixa un rectangle arrossegant sobre el mapa.</div>
+ <div id="icgcbox" hidden>
+  <strong>Zona a Catalunya</strong><br>
+  Pots baixar el model d'elevacions de l'ICGC (fins a 0,5 m) d'aquesta zona:
+  <a id="icgclink" href="https://visors.icgc.cat/appdownloads/?c=fmevtmet" target="_blank" rel="noopener">Obrir el visor de descàrregues de l'ICGC ↗</a>
+  <div id="utmbox"></div>
+  <small>Al visor, marca la zona i baixa el GeoTIFF; després carrega'l a «Dades d'alta resolució».
+  <a href="https://www.icgc.cat/ca/Geoinformacio-i-mapes/Dades-i-productes/Elevacions/Elevacions-territorial/Models-delevacions" target="_blank" rel="noopener">Més informació sobre els models</a></small>
+ </div>
  <p><small>Elevació: <a href="https://registry.opendata.aws/terrain-tiles/" target="_blank" rel="noopener">Terrain Tiles</a> (SRTM, ASTER, LiDAR…) ·
  Mapa: © OpenTopoMap, © OpenStreetMap · Cerca: Nominatim.<br>Tot es calcula al teu navegador.</small></p>
 </div>
@@ -189,6 +201,12 @@ function update() {
   const mm = +$('mm').value, k = mm / Math.max(w, h);
   $('info').textContent = `Zona: ${w.toFixed(1)} × ${h.toFixed(1)} km\nModel: ${(w * k).toFixed(0)} × ${(h * k).toFixed(0)} mm\nEscala ≈ 1:${Math.round(Math.max(w, h) * 1e6 / mm).toLocaleString('ca')}`;
   $('gen').disabled = false; $('prev').disabled = false;
+  const cat = inCatalonia(b); $('icgcbox').hidden = !cat;
+  if (cat) {
+    const p = [[b.getSouth(), b.getWest()], [b.getSouth(), b.getEast()], [b.getNorth(), b.getWest()], [b.getNorth(), b.getEast()]].map(q => utm31(q[0], q[1]));
+    const E = p.map(q => q[0]), N = p.map(q => q[1]);
+    $('utmbox').textContent = `Coordenades UTM 31N (EPSG:25831): X ${Math.round(Math.min(...E))}–${Math.round(Math.max(...E))} · Y ${Math.round(Math.min(...N))}–${Math.round(Math.max(...N))}`;
+  }
 }
 $('draw').onclick = () => {
   mode = true; map.dragging.disable(); map.getContainer().style.cursor = 'crosshair';
