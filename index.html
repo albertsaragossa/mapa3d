@@ -17,6 +17,8 @@
  button.sec{background:#e9e9e9;color:#222} button:disabled{opacity:.5;cursor:default}
  #info{margin-top:12px;padding:8px;background:#fff;border:1px solid #ddd;border-radius:6px;min-height:60px;white-space:pre-line}
  small{color:#666}
+ select{width:100%;padding:6px;border:1px solid #bbb;border-radius:6px;background:#fff}
+ #otbox[hidden]{display:none}
  #icgcbox{margin-top:10px;padding:8px;background:#eef6f0;border:1px solid #b9d8c4;border-radius:6px}
  #icgcbox[hidden]{display:none}
  #icgclink{display:block;margin:8px 0;padding:9px;border-radius:6px;background:#2f6f4f;color:#fff;text-align:center;text-decoration:none}
@@ -35,12 +37,27 @@
  <input type="text" id="q" placeholder="Montserrat, Everest, Pica d'Estats…">
  <button class="sec" id="go">Cercar</button>
  <button class="sec" id="draw">1. Dibuixar rectangle</button>
+ <label>Rotació del rectangle: <span id="rotv">0</span>° <small>(+ = antihorari)</small></label>
+ <input type="range" id="rot" min="-90" max="90" step="1" value="0" style="width:100%">
  <label>Mida del costat llarg (mm)</label><input type="number" id="mm" value="150" min="10" max="500">
  <label>Exageració vertical (×)</label><input type="number" id="exag" value="2" step="0.5" min="0.5" max="10">
  <label>Gruix de la base (mm)</label><input type="number" id="base" value="3" step="0.5" min="1" max="30">
  <label>Resolució (punts al costat llarg)</label><input type="number" id="res" value="300" min="50" max="1200" step="50"><small id="resnote"></small>
  <label><input type="checkbox" id="sea" checked> Aplanar el mar (cotes &lt; 0 → 0)</label>
- <label><input type="checkbox" id="icgc" checked> A Catalunya, usar l'ICGC (LiDAR, fins a 0,5 m) — experimental</label>
+ <label><input type="checkbox" id="icgc"> A Catalunya, provar la descàrrega automàtica de l'ICGC (experimental, de moment no funciona)</label>
+ <label>Font d'elevació global</label>
+ <select id="src">
+  <option value="terrain">Terrain Tiles (per defecte, sense clau)</option>
+  <option value="COP30">OpenTopography · Copernicus 30 m</option>
+  <option value="EU_DTM">OpenTopography · EU DTM 30 m (Europa, sense vegetació)</option>
+  <option value="AW3D30">OpenTopography · ALOS AW3D30 30 m</option>
+  <option value="NASADEM">OpenTopography · NASADEM 30 m</option>
+  <option value="SRTMGL1">OpenTopography · SRTM 30 m</option>
+ </select>
+ <div id="otbox" hidden>
+  <input type="text" id="otkey" placeholder="Clau API d'OpenTopography" autocomplete="off" style="margin-top:6px">
+  <small>Gratuïta: <a href="https://portal.opentopography.org/" target="_blank" rel="noopener">crea un compte a OpenTopography</a> i demana-la a myOpenTopo. Es desa només al teu navegador.</small>
+ </div>
  <label>Dades d'alta resolució (opcional)</label>
  <input type="file" id="file" accept=".tif,.tiff,.asc,.txt">
  <small>GeoTIFF (.tif) de l'ICGC o ASCII Grid (.asc). Si hi ha un rectangle dins la zona del fitxer, es retalla; si no, s'usa tot el fitxer.</small>
@@ -92,7 +109,7 @@ async function fetchElevation(s, w, n, e, res, progress) {
   const tx0 = Math.floor(x0 / 256), tx1 = Math.floor(x1 / 256);
   const ty0 = Math.floor(y0 / 256), ty1 = Math.floor(y1 / 256);
   const cols = tx1 - tx0 + 1, rows = ty1 - ty0 + 1;
-  if (cols * rows > 144) throw new Error('Zona massa gran.');
+  if (cols * rows > 256) throw new Error('Zona massa gran.');
 
   const cv = document.createElement('canvas');
   cv.width = cols * 256; cv.height = rows * 256;
@@ -195,11 +212,10 @@ L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png', {maxZoom: 17,
 let rect = null, start = null, drawing = false, mode = false;
 
 function update() {
-  const b = rect.getBounds(), lat = (b.getSouth() + b.getNorth()) / 2;
-  const w = (b.getEast() - b.getWest()) * 111.32 * Math.cos(lat * Math.PI / 180);
-  const h = (b.getNorth() - b.getSouth()) * 110.574;
+  const b = rect.getBounds(), w = sel.W / 1000, h = sel.H / 1000;
+  const rotTxt = +$('rot').value ? ` (girada ${$('rot').value}°)` : '';
   const mm = +$('mm').value, k = mm / Math.max(w, h);
-  $('info').textContent = `Zona: ${w.toFixed(1)} × ${h.toFixed(1)} km\nModel: ${(w * k).toFixed(0)} × ${(h * k).toFixed(0)} mm\nEscala ≈ 1:${Math.round(Math.max(w, h) * 1e6 / mm).toLocaleString('ca')}`;
+  $('info').textContent = `Zona: ${w.toFixed(1)} × ${h.toFixed(1)} km${rotTxt}\nModel: ${(w * k).toFixed(0)} × ${(h * k).toFixed(0)} mm\nEscala ≈ 1:${Math.round(Math.max(w, h) * 1e6 / mm).toLocaleString('ca')}`;
   $('gen').disabled = false; $('prev').disabled = false;
   const cat = inCatalonia(b); $('icgcbox').hidden = !cat;
   if (cat) {
@@ -208,21 +224,38 @@ function update() {
     $('utmbox').textContent = `Coordenades UTM 31N (EPSG:25831): X ${Math.round(Math.min(...E))}–${Math.round(Math.max(...E))} · Y ${Math.round(Math.min(...N))}–${Math.round(Math.max(...N))}`;
   }
 }
+let sel = null;   // {lat, lon, W, H}: centre i mides del rectangle en metres
+const mc = map.getContainer();
+const mPerLon = lat => 111320 * Math.cos(lat * Math.PI / 180);
+function drawSel() {
+  const t = (+$('rot').value || 0) * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t);
+  const pts = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([p, q]) => {
+    const x = p * sel.W / 2, y = q * sel.H / 2;
+    return [sel.lat + (x * sn + y * cs) / 110574, sel.lon + (x * cs - y * sn) / mPerLon(sel.lat)];
+  });
+  if (rect) rect.setLatLngs(pts); else rect = L.polygon(pts, {color: '#e4572e', weight: 2}).addTo(map);
+}
+function setFromDrag(p, q) {   // la diagonal arrossegada defineix el rectangle, ja girat
+  const t = (+$('rot').value || 0) * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t);
+  const lat = (p.lat + q.lat) / 2, lon = (p.lng + q.lng) / 2;
+  const du = (q.lng - p.lng) * mPerLon(lat), dv = (q.lat - p.lat) * 110574;
+  sel = {lat, lon, W: Math.max(Math.abs(du * cs + dv * sn), 1), H: Math.max(Math.abs(-du * sn + dv * cs), 1)};
+  drawSel(); update();
+}
+function endDraw() { mode = false; map.dragging.enable(); mc.style.cursor = ''; mc.style.touchAction = ''; }
 $('draw').onclick = () => {
-  mode = true; map.dragging.disable(); map.getContainer().style.cursor = 'crosshair';
-  $('info').textContent = 'Arrossega sobre el mapa per marcar la zona.';
+  mode = true; map.dragging.disable(); mc.style.cursor = 'crosshair'; mc.style.touchAction = 'none';
+  $('info').textContent = 'Arrossega (amb el ratolí o el dit) sobre el mapa per marcar la zona.';
 };
-map.on('mousedown', e => {
-  if (!mode) return; drawing = true; start = e.latlng;
-  if (rect) map.removeLayer(rect);
-  rect = L.rectangle([start, start], {color: '#e4572e', weight: 2}).addTo(map);
+mc.addEventListener('pointerdown', ev => {
+  if (!mode || !ev.isPrimary) return;
+  drawing = true; start = map.mouseEventToLatLng(ev);
+  try { mc.setPointerCapture(ev.pointerId); } catch (e) {}
 });
-map.on('mousemove', e => { if (drawing) { rect.setBounds([start, e.latlng]); update(); } });
-map.on('mouseup', e => {
-  if (!drawing) return; drawing = false; mode = false;
-  map.dragging.enable(); map.getContainer().style.cursor = '';
-  rect.setBounds([start, e.latlng]); update();
-});
+mc.addEventListener('pointermove', ev => { if (drawing) setFromDrag(start, map.mouseEventToLatLng(ev)); });
+mc.addEventListener('pointerup', ev => { if (!drawing) return; drawing = false; setFromDrag(start, map.mouseEventToLatLng(ev)); endDraw(); });
+mc.addEventListener('pointercancel', () => { drawing = false; endDraw(); });
+$('rot').addEventListener('input', () => { $('rotv').textContent = $('rot').value; if (sel) { drawSel(); update(); } });
 $('mm').oninput = () => { if (rect) update(); };
 
 async function search() {
@@ -350,15 +383,52 @@ async function fetchICGC(s, w, n, e, res, progress) {
   return {elev: out, nx, ny, wm: W, hm: H, cell};
 }
 
+async function fetchOT(dem, s, w, n, e, key) {   // OpenTopography Global DEM API (GeoTIFF, EPSG:4326)
+  const url = `https://portal.opentopography.org/API/globaldem?demtype=${dem}&south=${s}&north=${n}&west=${w}&east=${e}&outputFormat=GTiff&API_Key=${encodeURIComponent(key)}`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error((await r.text()).replace(/<[^>]*>/g, ' ').trim().slice(0, 160) || 'resposta ' + r.status);
+  let img;
+  try { img = await (await GeoTIFF.fromArrayBuffer(await r.arrayBuffer())).getImage(); }
+  catch (err) { throw new Error('la resposta no és un TIFF vàlid'); }
+  const [bx0, by0, bx1, by1] = img.getBoundingBox(), nc = img.getWidth(), nr = img.getHeight();
+  const a = (await img.readRasters({samples: [0]}))[0];
+  const mid = (by0 + by1) / 2 * Math.PI / 180, nd = img.getGDALNoData();
+  return {g: a instanceof Float32Array ? a : Float32Array.from(a), nc, nr,
+          cell: (bx1 - bx0) / nc * 111320 * Math.cos(mid), celly: (by1 - by0) / nr * 110574,
+          nod: nd == null ? -9999 : nd};
+}
+
+function rotateData(d, rotDeg, W, H, res) {   // remostreja la graella (caixa axial) al rectangle girat
+  const {elev, nx, ny, wm, hm} = d, t = rotDeg * Math.PI / 180, cs = Math.cos(t), sn = Math.sin(t);
+  const step = Math.min(wm / nx, hm / ny), long = Math.max(W, H);
+  const n = Math.max(2, Math.min(res, Math.round(long / step)));
+  let ox, oy;
+  if (W >= H) { ox = n; oy = Math.max(2, Math.round(n * H / W)); } else { oy = n; ox = Math.max(2, Math.round(n * W / H)); }
+  const out = new Float32Array(ox * oy);
+  for (let i = 0; i < oy; i++) {
+    const v = H / 2 - (i + 0.5) / oy * H;
+    for (let j = 0; j < ox; j++) {
+      const u = (j + 0.5) / ox * W - W / 2, x = u * cs - v * sn, y = u * sn + v * cs;
+      const fx = Math.min(Math.max((x + wm / 2) / wm * nx - 0.5, 0), nx - 1);
+      const fy = Math.min(Math.max((hm / 2 - y) / hm * ny - 0.5, 0), ny - 1);
+      const x0 = Math.floor(fx), y0 = Math.floor(fy), x1 = Math.min(x0 + 1, nx - 1), y1 = Math.min(y0 + 1, ny - 1);
+      const dx = fx - x0, dy = fy - y0;
+      out[i * ox + j] = (elev[y0 * nx + x0] * (1 - dx) + elev[y0 * nx + x1] * dx) * (1 - dy) +
+                        (elev[y1 * nx + x0] * (1 - dx) + elev[y1 * nx + x1] * dx) * dy;
+    }
+  }
+  return {elev: out, nx: ox, ny: oy, wm: W, hm: H};
+}
+
 async function tifToGrid(t) {   // GeoTIFF local (EPSG:25831): retalla al rectangle si hi cau
-  let l = 0, tp = 0, r = t.W, b = t.H;
-  if (rect) {
+  let l = 0, tp = 0, r = t.W, b = t.H, cropped = false;
+  if (rect && (!t.crs || t.crs === 25831)) {
     const bd = map.wrapLatLngBounds(rect.getBounds());
     const pts = [[bd.getSouth(), bd.getWest()], [bd.getSouth(), bd.getEast()], [bd.getNorth(), bd.getWest()], [bd.getNorth(), bd.getEast()]].map(p => utm31(p[0], p[1]));
     const Es = pts.map(p => p[0]), Ns = pts.map(p => p[1]);
     const l2 = Math.max(0, Math.floor((Math.min(...Es) - t.ox) / t.rx)), r2 = Math.min(t.W, Math.ceil((Math.max(...Es) - t.ox) / t.rx));
     const t2 = Math.max(0, Math.floor((t.oy - Math.max(...Ns)) / t.ry)), b2 = Math.min(t.H, Math.ceil((t.oy - Math.min(...Ns)) / t.ry));
-    if (r2 - l2 > 1 && b2 - t2 > 1) { l = l2; r = r2; tp = t2; b = b2; }
+    if (r2 - l2 > 1 && b2 - t2 > 1) { l = l2; r = r2; tp = t2; b = b2; cropped = true; }
   }
   let w = r - l, h = b - tp;
   const opts = {window: [l, tp, r, b], samples: [0]};
@@ -369,7 +439,7 @@ async function tifToGrid(t) {   // GeoTIFF local (EPSG:25831): retalla al rectan
   }
   const a = (await t.img.readRasters(opts))[0];
   return {g: a instanceof Float32Array ? a : Float32Array.from(a), nc: w, nr: h,
-          cell: (r - l) * t.rx / w, celly: (b - tp) * t.ry / h, nod: t.nod};
+          cell: (r - l) * t.rx / w, celly: (b - tp) * t.ry / h, nod: t.nod, cropped};
 }
 
 let lastData = null, lastKey = '', lastSource = '', frame = true;
@@ -379,34 +449,54 @@ function setBusy(v) { $('gen').disabled = $('prev').disabled = $('pvdl').disable
 
 async function ensureData() {
   const res = Math.min(1200, Math.max(50, +$('res').value || 300));
+  const rot = sel ? (+$('rot').value || 0) : 0;
+  let resF = res;   // amb rotació cal obtenir més mostres perquè el rectangle girat en tingui `res`
+  if (rot && rect) {
+    const q = rect.getBounds(), la = (q.getSouth() + q.getNorth()) / 2;
+    const k = Math.max((q.getEast() - q.getWest()) * mPerLon(la), (q.getNorth() - q.getSouth()) * 110574) / Math.max(sel.W, sel.H);
+    resF = Math.min(2000, Math.round(res * Math.max(1, k)));
+  }
   if (fileSrc) {
     const bb = fileSrc.tif && rect ? map.wrapLatLngBounds(rect.getBounds()).toBBoxString() : '';
-    const k = 'file:' + fileSrc.name + ':' + res + ':' + bb;
+    const k = 'file:' + fileSrc.name + ':' + res + ':' + bb + ':' + rot;
     if (k !== lastKey) {
       $('info').textContent = 'Processant el fitxer…';
       await new Promise(r => setTimeout(r, 30));
-      lastData = gridToData(fileSrc.tif ? await tifToGrid(fileSrc.tif) : fileSrc, res);
+      const f = fileSrc.tif ? await tifToGrid(fileSrc.tif) : fileSrc;
+      lastData = gridToData(f, fileSrc.tif ? resF : res);
+      if (fileSrc.tif && f.cropped && rot) lastData = rotateData(lastData, rot, sel.W, sel.H, res);
       lastKey = k; lastSource = 'fitxer ' + fileSrc.name; frame = true;
     }
     return lastData;
   }
   const b = map.wrapLatLngBounds(rect.getBounds());
   const useIcgc = $('icgc').checked && inCatalonia(b);
-  const key = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res, useIcgc].join();
+  const otSrc = $('src').value, otKey = $('otkey').value.trim();
+  const key = [b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res, useIcgc, otSrc, rot, sel ? Math.round(sel.W) : 0].join();
   if (key !== lastKey || !lastData) {
     let d = null, src = '';
+    const notes = [];
     if (useIcgc) {
       try {
-        d = await fetchICGC(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
+        d = await fetchICGC(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), resF,
           (i, t) => { $('info').textContent = `Descarregant dades de l'ICGC… ${i}/${t}`; });
         src = `ICGC (LiDAR, capa de ${d.cell === 0.5 ? '50 cm' : d.cell + ' m'})`;
-      } catch (err) { src = 'Terrain Tiles (ICGC no disponible: ' + err.message + ')'; }
+      } catch (err) { notes.push('ICGC no disponible: ' + err.message); }
+    }
+    if (!d && otSrc !== 'terrain') {
+      try {
+        if (!otKey) throw new Error('cal la clau API');
+        $('info').textContent = "Descarregant dades d'OpenTopography…";
+        d = gridToData(await fetchOT(otSrc, b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), otKey), resF);
+        src = 'OpenTopography ' + otSrc;
+      } catch (err) { notes.push('OpenTopography no disponible: ' + err.message); }
     }
     if (!d) {
-      d = await fetchElevation(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), res,
+      d = await fetchElevation(b.getSouth(), b.getWest(), b.getNorth(), b.getEast(), resF,
         (i, t) => { $('info').textContent = `Descarregant dades d'elevació… ${i}/${t}`; });
-      src = src || 'Terrain Tiles (mundial)';
+      src = 'Terrain Tiles' + (notes.length ? ' (' + notes.join(' · ') + ')' : ' (mundial)');
     }
+    if (rot && sel) d = rotateData(d, rot, sel.W, sel.H, res);
     lastData = d; lastSource = src; lastKey = key; frame = true;
   }
   return lastData;
@@ -435,7 +525,7 @@ $('file').onchange = async ev => {
     if (/\.tiff?$/i.test(f.name)) {
       const img = await (await GeoTIFF.fromBlob(f)).getImage();
       const [ox, oy] = img.getOrigin(), [rx, ry] = img.getResolution(), nd = img.getGDALNoData();
-      fileSrc = {name: f.name, tif: {img, W: img.getWidth(), H: img.getHeight(), ox, oy, rx: Math.abs(rx), ry: Math.abs(ry), nod: nd == null ? -9999 : nd}};
+      fileSrc = {name: f.name, tif: {img, crs: (img.getGeoKeys() || {}).ProjectedCSTypeGeoKey, W: img.getWidth(), H: img.getHeight(), ox, oy, rx: Math.abs(rx), ry: Math.abs(ry), nod: nd == null ? -9999 : nd}};
       msg = `GeoTIFF carregat: ${fileSrc.tif.W}×${fileSrc.tif.H} punts, cel·la de ${fileSrc.tif.rx} m.\nSi hi ha un rectangle dibuixat dins la zona, es retallarà; si no, s'usa tot el fitxer.`;
     } else {
       fileSrc = parseASC(await f.text()); fileSrc.name = f.name;
@@ -453,6 +543,9 @@ function resNote() {
   $('resnote').textContent = `≈ ${(tri / 1e6).toFixed(2)} M triangles · STL ≈ ${(tri * 50 / 1e6).toFixed(0)} MB` + (r > 800 ? ' (pesat per al llescador)' : '');
 }
 $('res').addEventListener('input', resNote); resNote();
+try { $('otkey').value = localStorage.getItem('otkey') || ''; } catch (e) {}
+$('otkey').addEventListener('input', () => { try { localStorage.setItem('otkey', $('otkey').value.trim()); } catch (e) {} });
+$('src').addEventListener('change', () => { $('otbox').hidden = $('src').value === 'terrain'; });
 $('gen').onclick = download;
 $('pvdl').onclick = download;
 
